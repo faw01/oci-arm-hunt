@@ -1,0 +1,118 @@
+name: Hunt OCI Ampere A1
+
+on:
+  schedule:
+    # Every 10 minutes UTC — stays under OCI launch rate limits (~150s floor)
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: oci-arm-hunt
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ap-kulai-2
+      AD: NVaT:AP-KULAI-2-AD-1
+      SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+      IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+      DISPLAY_NAME: penrose
+    steps:
+      - name: Install OCI CLI
+        run: |
+          python3 -m pip install --quiet oci-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write SSH public key
+        run: |
+          printf '%s\n' "${{ secrets.SSH_PUBLIC_KEY }}" > "$RUNNER_TEMP/oci-ampere.pub"
+          chmod 644 "$RUNNER_TEMP/oci-ampere.pub"
+
+      - name: Skip if instance already exists
+        id: check
+        run: |
+          set -euo pipefail
+          COUNT=$(oci compute instance list \
+            --compartment-id "$OCI_CLI_TENANCY" \
+            --display-name "$DISPLAY_NAME" \
+            --lifecycle-state RUNNING \
+            --query 'length(data)' \
+            --raw-output 2>/dev/null || echo 0)
+          PROV=$(oci compute instance list \
+            --compartment-id "$OCI_CLI_TENANCY" \
+            --display-name "$DISPLAY_NAME" \
+            --lifecycle-state PROVISIONING \
+            --query 'length(data)' \
+            --raw-output 2>/dev/null || echo 0)
+          echo "running=$COUNT provisioning=$PROV"
+          if [ "${COUNT:-0}" != "0" ] || [ "${PROV:-0}" != "0" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Instance $DISPLAY_NAME already present — hunt done."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Disable schedule after success
+        if: steps.check.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/hunt.yml/disable" || true
+          echo "Workflow disable attempted. Confirm under Actions if still scheduled."
+
+      - name: Launch 2 OCPU / 12 GB
+        if: steps.check.outputs.exists == 'false'
+        id: launch
+        run: |
+          set +e
+          oci compute instance launch \
+            --availability-domain "$AD" \
+            --compartment-id "$OCI_CLI_TENANCY" \
+            --subnet-id "$SUBNET_ID" \
+            --shape VM.Standard.A1.Flex \
+            --shape-config '{"ocpus":2.0,"memoryInGBs":12.0}' \
+            --image-id "$IMAGE_ID" \
+            --display-name "$DISPLAY_NAME" \
+            --hostname-label penrose \
+            --assign-public-ip true \
+            --assign-private-dns-record true \
+            --boot-volume-size-in-gbs 200 \
+            --is-pv-encryption-in-transit-enabled true \
+            --ssh-authorized-keys-file "$RUNNER_TEMP/oci-ampere.pub" \
+            > "$RUNNER_TEMP/launch.out" 2>&1
+          RC=$?
+          cat "$RUNNER_TEMP/launch.out"
+          if [ $RC -eq 0 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qi "out of host capacity" "$RUNNER_TEMP/launch.out"; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Out of host capacity — retry next schedule."
+            exit 0
+          fi
+          if grep -qi "TooManyRequests" "$RUNNER_TEMP/launch.out"; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Rate limited — backing off until next run."
+            exit 0
+          fi
+          echo "::error::Unexpected launch failure"
+          exit 1
+
+      - name: Disable workflow on successful launch
+        if: steps.launch.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/hunt.yml/disable" || true
+          echo "::notice::LAUNCHED — disable workflow and reserve the public IP next."
